@@ -1,209 +1,329 @@
 package main
 
 import (
-    "database/sql"
-    "fmt"
-    "io"
-    "io/ioutil"
-    "log"
-    "net"
-    "net/http"
-    "net/url"
-    "os"
-    "strings"
-    "sync"
-    "time"
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
-    proxy1 "golang.org/x/net/proxy"
-    _ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
+	proxy1 "golang.org/x/net/proxy"
 )
 
 // 测试代理是否可用
 func testProxy(proxy string, wg *sync.WaitGroup, results chan<- string) {
-    defer wg.Done()
+	defer wg.Done()
 
-    parts := strings.Split(proxy, ":")
-    if len(parts) != 2 {
-        return
-    }
+	parts := strings.Split(proxy, ":")
+	if len(parts) != 2 {
+		return
+	}
 
-    host := parts[0]
-    port := parts[1]
+	host := parts[0]
+	port := parts[1]
 
-    // 创建一个 Dialer 来检测代理
-    dialer := &net.Dialer{
-        Timeout:   2 * time.Second,
-        KeepAlive: 2 * time.Second,
-    }
+	baseDialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
 
-    // 设置 SOCKS5 代理
-    transport := &http.Transport{
-        Proxy: http.ProxyURL(&url.URL{
-            Scheme: "socks5",
-            Host:   fmt.Sprintf("%s:%s", host, port),
-        }),
-        DialContext: dialer.DialContext,
-    }
+	dialer, err := proxy1.SOCKS5("tcp", fmt.Sprintf("%s:%s", host, port), nil, baseDialer)
+	if err != nil {
+		return
+	}
 
-    client := &http.Client{
-        Transport: transport,
-        Timeout:   10 * time.Second,
-    }
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
+	}
 
-    // 尝试连接公共网站
-    resp, err := client.Get("http://ifconfig.me")
-    if err == nil && resp.StatusCode == 200 {
-        results <- proxy
-        resp.Body.Close()
-    }
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	resp, err := client.Get("http://ifconfig.me")
+	if err == nil && resp.StatusCode == 200 {
+		results <- proxy
+		resp.Body.Close()
+	}
 }
 
 // 启动本地 SOCKS5 代理服务器
 func startProxyServer(db *sql.DB) {
-    listener, err := net.Listen("tcp", ":8088")
-    if err != nil {
-        log.Fatalf("Failed to start proxy server: %v", err)
-    }
-    defer listener.Close()
-    log.Println("Starting proxy server on :8088")
+	listener, err := net.Listen("tcp", ":8088")
+	if err != nil {
+		log.Fatalf("Failed to start proxy server: %v", err)
+	}
+	log.Println("Starting proxy server on :8088")
 
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            log.Printf("Failed to accept connection: %v", err)
-            continue
-        }
-        go handleConnection(conn, db)
-    }
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Shutting down server...")
+		listener.Close()
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				break
+			}
+			log.Printf("Failed to accept connection: %v", err)
+			continue
+		}
+		go handleConnection(conn, db)
+	}
 }
 
 // 处理代理连接
 func handleConnection(conn net.Conn, db *sql.DB) {
-    defer conn.Close()
+	defer conn.Close()
 
-    // 从数据库中随机选择一个可用代理
-    row := db.QueryRow("SELECT proxy FROM proxies ORDER BY RANDOM() LIMIT 1")
-    var proxy string
-    err := row.Scan(&proxy)
-    if err != nil {
-        log.Printf("No available proxy: %v", err)
-        return
-    }
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		row := db.QueryRow("SELECT proxy FROM proxies ORDER BY RANDOM() LIMIT 1")
+		var proxy string
+		err := row.Scan(&proxy)
+		if err != nil {
+			log.Printf("No available proxy: %v", err)
+			return
+		}
 
-    parts := strings.Split(proxy, ":")
-    if len(parts) != 2 {
-        log.Println("Invalid proxy format")
-        return
-    }
+		parts := strings.Split(proxy, ":")
+		if len(parts) != 2 {
+			continue
+		}
 
-    host := parts[0]
-    port := parts[1]
+		host := parts[0]
+		port := parts[1]
 
-    // 使用 golang.org/x/net/proxy 创建 SOCKS5 代理客户端
-    dialer, err := proxy1.SOCKS5("tcp", fmt.Sprintf("%s:%s", host, port), nil, proxy1.Direct)
-    if err != nil {
-        log.Printf("Failed to connect to SOCKS5 proxy %s:%s: %v", host, port, err)
-        return
-    }
+		dialer, err := proxy1.SOCKS5("tcp", fmt.Sprintf("%s:%s", host, port), nil, proxy1.Direct)
+		if err != nil {
+			log.Printf("Failed to connect to SOCKS5 proxy %s:%s: %v, retrying...", host, port, err)
+			continue
+		}
 
-    // 连接到目标服务器
-    targetConn, err := dialer.Dial("tcp", conn.RemoteAddr().String())
-    if err != nil {
-        log.Printf("Failed to connect to target: %v", err)
-        return
-    }
-    defer targetConn.Close()
+		if err := socks5Handshake(conn, dialer); err != nil {
+			log.Printf("SOCKS5 handshake failed: %v, retrying...", err)
+			continue
+		}
+		return
+	}
+	log.Printf("All proxy retries failed")
+}
 
-    // 启动两个 goroutine 来转发流量
-    go func() {
-        // 转发客户端请求到目标服务器，并记录流量
-        _, err := io.Copy(targetConn, conn)
-        if err != nil {
-            log.Printf("Error forwarding request to target: %v", err)
-        }
-    }()
+func socks5Handshake(clientConn net.Conn, dialer proxy1.Dialer) error {
+	buf := make([]byte, 256)
 
-    _, err = io.Copy(conn, targetConn)
-    if err != nil {
-        log.Printf("Error forwarding response to client: %v", err)
-    }
+	_, err := clientConn.Read(buf[:2])
+	if err != nil {
+		return fmt.Errorf("read version and nmethods: %v", err)
+	}
+
+	version := buf[0]
+	nmethods := buf[1]
+
+	if version != 5 {
+		return fmt.Errorf("unsupported SOCKS version: %d", version)
+	}
+
+	_, err = clientConn.Read(buf[:nmethods])
+	if err != nil {
+		return fmt.Errorf("read methods: %v", err)
+	}
+
+	_, err = clientConn.Write([]byte{5, 0})
+	if err != nil {
+		return fmt.Errorf("write method selection: %v", err)
+	}
+
+	_, err = clientConn.Read(buf[:4])
+	if err != nil {
+		return fmt.Errorf("read request header: %v", err)
+	}
+
+	cmd := buf[1]
+	atyp := buf[3]
+
+	if cmd != 1 {
+		clientConn.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("unsupported command: %d", cmd)
+	}
+
+	var targetAddr string
+	var targetPort uint16
+
+	switch atyp {
+	case 1:
+		_, err = clientConn.Read(buf[:6])
+		if err != nil {
+			return fmt.Errorf("read IPv4 address: %v", err)
+		}
+		targetAddr = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+		targetPort = uint16(buf[4])<<8 | uint16(buf[5])
+	case 3:
+		_, err = clientConn.Read(buf[:1])
+		if err != nil {
+			return fmt.Errorf("read domain length: %v", err)
+		}
+		domainLen := buf[0]
+		_, err = clientConn.Read(buf[:domainLen+2])
+		if err != nil {
+			return fmt.Errorf("read domain and port: %v", err)
+		}
+		targetAddr = string(buf[:domainLen])
+		targetPort = uint16(buf[domainLen])<<8 | uint16(buf[domainLen+1])
+	case 4:
+		_, err = clientConn.Read(buf[:18])
+		if err != nil {
+			return fmt.Errorf("read IPv6 address: %v", err)
+		}
+		targetAddr = fmt.Sprintf("[%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x]",
+			buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+			buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15])
+		targetPort = uint16(buf[16])<<8 | uint16(buf[17])
+	default:
+		clientConn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("unsupported address type: %d", atyp)
+	}
+
+	targetConn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", targetAddr, targetPort))
+	if err != nil {
+		clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		return fmt.Errorf("connect to target %s:%d: %v", targetAddr, targetPort, err)
+	}
+	defer targetConn.Close()
+
+	_, err = clientConn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	if err != nil {
+		return fmt.Errorf("write connect response: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(targetConn, clientConn)
+		targetConn.Close()
+	}()
+
+	go func() {
+		defer wg.Done()
+		io.Copy(clientConn, targetConn)
+		clientConn.Close()
+	}()
+
+	wg.Wait()
+	return nil
 }
 
 func main() {
-    // 删除已存在的 proxies.db
-    if _, err := os.Stat("proxies.db"); err == nil {
-        err = os.Remove("proxies.db")
-        if err != nil {
-            fmt.Printf("Failed to remove existing proxies.db: %v\n", err)
-            return
-        }
-    }
+	db, err := sql.Open("sqlite3", "proxies.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 
-    url := "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/socks5.txt"
-    resp, err := http.Get(url)
-    if err != nil {
-        fmt.Printf("获取代理列表失败: %v\n", err)
-        return
-    }
-    defer resp.Body.Close()
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, proxy TEXT)")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        fmt.Printf("读取代理列表失败: %v\n", err)
-        return
-    }
+	existingProxies := make(map[string]bool)
+	var existingRows *sql.Rows
+	existingRows, err = db.Query("SELECT proxy FROM proxies")
+	if err == nil {
+		for existingRows.Next() {
+			var proxy string
+			if err := existingRows.Scan(&proxy); err == nil {
+				existingProxies[proxy] = true
+			}
+		}
+		existingRows.Close()
+	}
+	log.Printf("Found %d existing proxies in database", len(existingProxies))
 
-    proxyList := strings.Split(string(body), "\n")
-    results := make(chan string, len(proxyList))
-    var wg sync.WaitGroup
-    // 限制并发数量为 50
-    semaphore := make(chan struct{}, 50)
+	url := "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/socks5.txt"
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Fatalf("Failed to fetch proxy list: %v", err)
+	}
+	defer resp.Body.Close()
 
-    // 打开或创建 SQLite 数据库
-    db, err := sql.Open("sqlite3", "proxies.db")
-    if err != nil {
-        fmt.Println(err)
-        return
-    }
-    defer db.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response: %v", err)
+	}
 
-    // 创建表
-    _, err = db.Exec("CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, proxy TEXT)")
-    if err != nil {
-        fmt.Println(err)
-        return
-    }
+	newProxyList := strings.Split(string(body), "\n")
 
-    // 测试代理
-    for _, proxy := range proxyList {
-        if proxy == "" {
-            continue
-        }
-        wg.Add(1)
-        semaphore <- struct{}{}
-        go func(p string) {
-            defer func() { <-semaphore }()
-            testProxy(p, &wg, results)
-        }(proxy)
-    }
+	allProxies := make(map[string]bool)
+	for proxy := range existingProxies {
+		allProxies[proxy] = true
+	}
+	for _, proxy := range newProxyList {
+		if proxy != "" {
+			allProxies[proxy] = true
+		}
+	}
 
-    go func() {
-        wg.Wait()
-        close(results)
-    }()
+	uniqueProxies := make([]string, 0, len(allProxies))
+	for proxy := range allProxies {
+		uniqueProxies = append(uniqueProxies, proxy)
+	}
 
-    // 插入可用代理
-    for result := range results {
-        if result != "" {
-            _, err = db.Exec("INSERT INTO proxies (proxy) VALUES (?)", result)
-            if err != nil {
-                fmt.Printf("插入代理 %s 失败: %v\n", result, err)
-            } else {
-                fmt.Printf("插入代理 %s 成功\n", result)
-            }
-        }
-    }
+	log.Printf("Total unique proxies after dedup: %d", len(uniqueProxies))
 
-    // 启动代理服务器
-    startProxyServer(db)
+	_, err = db.Exec("DELETE FROM proxies")
+	if err != nil {
+		log.Fatalf("Failed to clear table: %v", err)
+	}
+
+	results := make(chan string, 500)
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 50)
+
+	log.Println("Testing proxies...")
+	testedCount := 0
+	successCount := 0
+
+	for _, proxy := range uniqueProxies {
+		wg.Add(1)
+		semaphore <- struct{}{}
+		go func(p string) {
+			defer func() { <-semaphore }()
+			testProxy(p, &wg, results)
+		}(proxy)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		testedCount++
+		if result != "" {
+			successCount++
+			_, err = db.Exec("INSERT INTO proxies (proxy) VALUES (?)", result)
+		}
+	}
+
+	log.Printf("Testing complete: %d/%d proxies available", successCount, testedCount)
+
+	startProxyServer(db)
 }
